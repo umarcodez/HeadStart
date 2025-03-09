@@ -5,6 +5,8 @@
  */
 const { query } = require('../config/db');
 const notificationService = require('./notificationService');
+const { v4: uuidv4 } = require('uuid');
+const { NotFoundError, ValidationError } = require('../utils/errors');
 
 /**
  * Create a new event
@@ -23,7 +25,12 @@ const createEvent = async (userId, eventData) => {
     color,
     isPrivate = false,
     participants,
-    categoryIds
+    categoryIds,
+    startDate,
+    endDate,
+    maxParticipants,
+    registrationDeadline,
+    tags
   } = eventData;
   
   // Validate required fields
@@ -43,6 +50,15 @@ const createEvent = async (userId, eventData) => {
     throw new Error('Start time must be before end time');
   }
   
+  // Validate date range
+  if (startDate && endDate && new Date(startDate) >= new Date(endDate)) {
+    throw new ValidationError('End date must be after start date');
+  }
+  
+  if (registrationDeadline && new Date(registrationDeadline) > new Date(startDate)) {
+    throw new ValidationError('Registration deadline must be before start date');
+  }
+  
   // Start a transaction
   await query('START TRANSACTION');
   
@@ -52,8 +68,8 @@ const createEvent = async (userId, eventData) => {
       `INSERT INTO events 
        (creator_id, title, description, location, location_url, 
         start_time, end_time, is_all_day, recurrence_pattern, 
-        recurrence_end_date, color, is_private, status) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled')`,
+        recurrence_end_date, color, is_private, status, start_date, end_date, max_participants, registration_deadline) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         userId, 
         title, 
@@ -66,7 +82,12 @@ const createEvent = async (userId, eventData) => {
         recurrencePattern || null, 
         recurrenceEndDate || null,
         color || '#3788d8',
-        isPrivate
+        isPrivate,
+        'scheduled',
+        startDate,
+        endDate,
+        maxParticipants,
+        registrationDeadline
       ]
     );
     
@@ -119,6 +140,33 @@ const createEvent = async (userId, eventData) => {
       }
     }
     
+    // Add tags if provided
+    if (tags && tags.length > 0) {
+      const tagValues = tags.map(tag => [uuidv4(), tag]).map(([id, name]) => [id, name]);
+      const tagIds = [];
+
+      for (const [tagId, tagName] of tagValues) {
+        // Try to find existing tag
+        const [existingTag] = await query('SELECT id FROM event_tags WHERE name = ?', [tagName]);
+        
+        if (existingTag) {
+          tagIds.push(existingTag.id);
+        } else {
+          // Create new tag
+          await query('INSERT INTO event_tags (id, name) VALUES (?, ?)', [tagId, tagName]);
+          tagIds.push(tagId);
+        }
+      }
+
+      // Create tag mappings
+      for (const tagId of tagIds) {
+        await query(
+          'INSERT INTO event_tag_mapping (event_id, tag_id) VALUES (?, ?)',
+          [eventId, tagId]
+        );
+      }
+    }
+    
     // Commit the transaction
     await query('COMMIT');
     
@@ -168,7 +216,12 @@ const updateEvent = async (eventId, userId, eventData) => {
     color,
     isPrivate,
     status,
-    categoryIds
+    categoryIds,
+    startDate,
+    endDate,
+    maxParticipants,
+    registrationDeadline,
+    tags
   } = eventData;
   
   // Validate start and end times if provided
@@ -183,6 +236,15 @@ const updateEvent = async (eventId, userId, eventData) => {
     if (start > end) {
       throw new Error('Start time must be before end time');
     }
+  }
+  
+  // Validate date range
+  if (startDate && endDate && new Date(startDate) >= new Date(endDate)) {
+    throw new ValidationError('End date must be after start date');
+  }
+  
+  if (registrationDeadline && startDate && new Date(registrationDeadline) > new Date(startDate)) {
+    throw new ValidationError('Registration deadline must be before start date');
   }
   
   // Start a transaction
@@ -204,6 +266,10 @@ const updateEvent = async (eventId, userId, eventData) => {
            color = ?, 
            is_private = ?,
            status = ?,
+           start_date = ?,
+           end_date = ?,
+           max_participants = ?,
+           registration_deadline = ?,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`,
       [
@@ -219,6 +285,10 @@ const updateEvent = async (eventId, userId, eventData) => {
         color || event.color,
         isPrivate !== undefined ? isPrivate : event.is_private,
         status || event.status,
+        startDate || event.start_date,
+        endDate || event.end_date,
+        maxParticipants || event.max_participants,
+        registrationDeadline || event.registration_deadline,
         eventId
       ]
     );
@@ -236,6 +306,31 @@ const updateEvent = async (eventId, userId, eventData) => {
         await query(
           'INSERT INTO event_category_relationship (event_id, category_id) VALUES (?, ?)',
           [eventId, categoryId]
+        );
+      }
+    }
+    
+    // Update tags if provided
+    if (tags) {
+      // Remove existing tags
+      await query('DELETE FROM event_tag_mapping WHERE event_id = ?', [eventId]);
+
+      // Add new tags
+      for (const tagName of tags) {
+        // Try to find existing tag
+        let [tag] = await query('SELECT id FROM event_tags WHERE name = ?', [tagName]);
+        
+        if (!tag) {
+          // Create new tag
+          const tagId = uuidv4();
+          await query('INSERT INTO event_tags (id, name) VALUES (?, ?)', [tagId, tagName]);
+          tag = { id: tagId };
+        }
+
+        // Create tag mapping
+        await query(
+          'INSERT INTO event_tag_mapping (event_id, tag_id) VALUES (?, ?)',
+          [eventId, tag.id]
         );
       }
     }
@@ -446,7 +541,8 @@ const getUserEvents = async (userId, filters = {}) => {
     status, 
     categories,
     includePrivate = true, // Include user's own private events
-    includeParticipating = true // Include events the user is participating in
+    includeParticipating = true, // Include events the user is participating in
+    tags
   } = filters;
   
   // Build the query based on filters
@@ -455,6 +551,8 @@ const getUserEvents = async (userId, filters = {}) => {
     FROM events e
     LEFT JOIN event_participants ep ON e.id = ep.event_id
     LEFT JOIN event_category_relationship ecr ON e.id = ecr.event_id
+    LEFT JOIN event_tag_mapping etm ON e.id = etm.event_id
+    LEFT JOIN event_tags et ON etm.tag_id = et.id
     WHERE (e.creator_id = ? OR
           (e.is_private = FALSE) OR
           (e.is_private = TRUE AND ep.user_id = ?))
@@ -490,6 +588,17 @@ const getUserEvents = async (userId, filters = {}) => {
   if (categories && Array.isArray(categories) && categories.length > 0) {
     sql += ' AND ecr.category_id IN (?)';
     params.push(categories);
+  }
+  
+  // Add tag filter
+  if (tags && Array.isArray(tags) && tags.length > 0) {
+    sql += ` AND e.id IN (
+      SELECT event_id 
+      FROM event_tag_mapping etm 
+      JOIN event_tags et ON etm.tag_id = et.id 
+      WHERE et.name IN (?)
+    )`;
+    params.push(tags);
   }
   
   // Include/exclude filters
@@ -1021,6 +1130,19 @@ const processDueReminders = async () => {
   };
 };
 
+/**
+ * Event Tags
+ */
+const getEventTags = async () => {
+  return await query('SELECT * FROM event_tags ORDER BY name');
+};
+
+const createEventTag = async (name) => {
+  const id = uuidv4();
+  await query('INSERT INTO event_tags (id, name) VALUES (?, ?)', [id, name]);
+  return { id, name };
+};
+
 module.exports = {
   createEvent,
   updateEvent,
@@ -1036,5 +1158,7 @@ module.exports = {
   deleteEventAttachment,
   addEventParticipants,
   removeEventParticipant,
-  processDueReminders
+  processDueReminders,
+  getEventTags,
+  createEventTag
 }; 
